@@ -1,13 +1,5 @@
 package org.sputnikdev.bluetooth.manager.impl;
 
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -21,16 +13,39 @@ import org.mockito.internal.util.reflection.Whitebox;
 import org.powermock.api.mockito.PowerMockito;
 import org.powermock.core.classloader.annotations.PrepareForTest;
 import org.powermock.modules.junit4.PowerMockRunner;
+import org.sputnikdev.bluetooth.Filter;
 import org.sputnikdev.bluetooth.URL;
-import org.sputnikdev.bluetooth.manager.*;
-import org.sputnikdev.bluetooth.manager.transport.*;
+import org.sputnikdev.bluetooth.manager.AdapterGovernor;
+import org.sputnikdev.bluetooth.manager.BluetoothGovernor;
+import org.sputnikdev.bluetooth.manager.BluetoothObjectType;
+import org.sputnikdev.bluetooth.manager.BluetoothObjectVisitor;
+import org.sputnikdev.bluetooth.manager.BluetoothSmartDeviceListener;
+import org.sputnikdev.bluetooth.manager.CharacteristicGovernor;
+import org.sputnikdev.bluetooth.manager.DeviceGovernor;
+import org.sputnikdev.bluetooth.manager.GattCharacteristic;
+import org.sputnikdev.bluetooth.manager.GattService;
+import org.sputnikdev.bluetooth.manager.GenericBluetoothDeviceListener;
+import org.sputnikdev.bluetooth.manager.transport.BluetoothObjectFactory;
+import org.sputnikdev.bluetooth.manager.transport.Characteristic;
+import org.sputnikdev.bluetooth.manager.transport.Device;
+import org.sputnikdev.bluetooth.manager.transport.Notification;
+import org.sputnikdev.bluetooth.manager.transport.Service;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyBoolean;
-import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -68,6 +83,10 @@ public class DeviceGovernorImplTest {
     private BluetoothSmartDeviceListener bluetoothSmartDeviceListener;
     @Mock
     private BluetoothObjectFactory bluetoothObjectFactory;
+    @Mock
+    private AdapterGovernorImpl adapterGovernor;
+    @Mock
+    private Filter<Short> rssiFilter;
 
     @Spy
     @InjectMocks
@@ -128,10 +147,13 @@ public class DeviceGovernorImplTest {
         charGovernors.add(mockCharacteristicGovernor(CHARACTERISTIC_2_URL));
         when(bluetoothManager.getGovernors(any())).thenReturn(charGovernors);
 
-        AdapterGovernorImpl adapterGovernor = mock(AdapterGovernorImpl.class);
+        adapterGovernor = mock(AdapterGovernorImpl.class);
         when(adapterGovernor.isReady()).thenReturn(true);
         when(adapterGovernor.isPowered()).thenReturn(true);
         when(bluetoothManager.getAdapterGovernor(URL)).thenReturn(adapterGovernor);
+
+        governor.setRssiFilter(null);
+        governor.setRssiReportingRate(0);
     }
 
     @Test
@@ -170,39 +192,114 @@ public class DeviceGovernorImplTest {
     }
 
     @Test
-    public void testUpdateConnectedBleDevice() throws Exception {
+    public void testUpdateConnectedLastChanged() throws Exception {
+        // this test verifies if "lastChanged" gets updated
+
+        // fixed variables
+        governor.setBlockedControl(false);
+        when(device.isBlocked()).thenReturn(false);
+        when(device.connect()).thenReturn(true);
+
+        short rssi = -77;
+        when(device.getRSSI()).thenReturn(rssi);
+
+        // not connected
+        when(device.isConnected()).thenReturn(false);
+        governor.setConnectionControl(false);
+        Date lastChanged = governor.getLastActivity();
+        assertNull(lastChanged);
+        governor.update(device);
+        // nothing should be changed
+        lastChanged = governor.getLastActivity();
+        assertNull(lastChanged);
+        verify(device, never()).getRSSI();
+        verify(genericDeviceListener, never()).rssiChanged(rssi);
+        assertNull(lastChanged);
+
+        // connected
+        when(device.isConnected()).thenReturn(true);
+        governor.setConnectionControl(true);
+        governor.update(device);
+        lastChanged = governor.getLastActivity();
+        assertNotNull(lastChanged);
+        // when connected, "lastChanged" should always be updated
+        verify(device, times(1)).getRSSI();
+        verify(genericDeviceListener, times(1)).rssiChanged(rssi);
+    }
+
+    @Test
+    public void testUpdateConnected() throws Exception {
+        //this test checks if native device gets updated in accordance with various combination of:
+        // connection control and the native device is connected
         doReturn(true).when(governor).isBleEnabled();
 
         governor.setBlockedControl(false);
         when(device.isBlocked()).thenReturn(false);
-        when(device.isConnected()).thenReturn(false).thenReturn(true).thenReturn(false).thenReturn(true);
         when(device.connect()).thenReturn(true);
 
-
+        // not connected and control == false
+        when(device.isConnected()).thenReturn(false);
         governor.setConnectionControl(false);
-
         governor.update(device);
         verify(device, never()).connect();
         verify(device, never()).disconnect();
 
+        // connected and control == true
+        when(device.isConnected()).thenReturn(true);
+        governor.setConnectionControl(true);
         governor.update(device);
         verify(device, never()).connect();
-        verify(device, times(1)).disconnect();
-        verify(bluetoothManager, times(1)).resetDescendants(URL);
+        verify(device, never()).disconnect();
 
+        // connected and control == false
+        when(device.isConnected()).thenReturn(true);
+        governor.setConnectionControl(false);
+        governor.update(device);
+        verify(device, never()).connect();
+        verify(device).disconnect();
+
+        // not connected and control == true
+        when(device.isConnected()).thenReturn(false);
         governor.setConnectionControl(true);
-
         governor.update(device);
-        verify(device, times(1)).connect();
-        verify(device, times(1)).disconnect();
-        verify(bluetoothManager, times(1)).updateDescendants(URL);
+        verify(device).connect();
+        verify(device).disconnect();
 
+    }
+
+    @Test
+    public void testUpdateConnectAndBlock() throws Exception {
+        doReturn(true).when(governor).isBleEnabled();
+
+        when(device.connect()).thenReturn(true);
+        governor.setBlockedControl(true);
+
+        when(device.isConnected()).thenReturn(false);
+        governor.setConnectionControl(true);
         governor.update(device);
-        verify(device, times(1)).connect();
-        verify(device, times(1)).disconnect();
+        verify(device, never()).connect();
+        verify(device, never()).disconnect();
 
-        verify(device, atLeastOnce()).isBlocked();
-        verify(device, atLeastOnce()).isConnected();
+        when(device.isConnected()).thenReturn(true);
+        governor.setConnectionControl(false);
+        governor.update(device);
+        verify(device, never()).connect();
+        verify(device, never()).disconnect();
+
+        governor.setBlockedControl(false);
+
+        when(device.isConnected()).thenReturn(true);
+        governor.setConnectionControl(false);
+        governor.update(device);
+        verify(device, never()).connect();
+        verify(device).disconnect();
+
+        when(device.isConnected()).thenReturn(false);
+        governor.setConnectionControl(true);
+        governor.update(device);
+        verify(device).connect();
+        verify(device).disconnect();
+
     }
 
     @Test
@@ -239,6 +336,8 @@ public class DeviceGovernorImplTest {
         verify(genericDeviceListener, times(0)).offline();
 
         Whitebox.setInternalState(governor, "lastActivity", Date.from(Instant.now().minusSeconds(onlineTimeout)));
+        governor.setBlockedControl(true);
+        when(device.isBlocked()).thenReturn(true);
 
         governor.update(device);
         verify(genericDeviceListener, times(1)).offline();
@@ -457,7 +556,7 @@ public class DeviceGovernorImplTest {
         governor.addGenericBluetoothDeviceListener(listener);
 
         governor.notifyBlocked(true);
-        governor.notifyRSSIChanged((short) -45);
+        governor.updateRSSI((short) -45);
         governor.notifyOnline(false);
         verify(listener, times(1)).blocked(true);
         verify(listener, times(1)).rssiChanged((short) -45);
@@ -465,7 +564,7 @@ public class DeviceGovernorImplTest {
         verify(listener, never()).online();
 
         governor.notifyBlocked(false);
-        governor.notifyRSSIChanged((short) -84);
+        governor.updateRSSI((short) -84);
         governor.notifyOnline(true);
         verify(listener, times(1)).blocked(false);
         verify(listener, times(1)).rssiChanged((short) -84);
@@ -474,7 +573,7 @@ public class DeviceGovernorImplTest {
 
         governor.removeGenericBluetoothDeviceListener(listener);
         governor.notifyBlocked(true);
-        governor.notifyRSSIChanged((short) -64);
+        governor.updateRSSI((short) -64);
         governor.notifyOnline(false);
         verifyNoMoreInteractions(listener);
     }
@@ -620,13 +719,13 @@ public class DeviceGovernorImplTest {
     }
 
     @Test
-    public void testNotifyRSSIChanged() {
+    public void testNotifyRSSIChangedNoFilter() {
         GenericBluetoothDeviceListener listener1 = mock(GenericBluetoothDeviceListener.class);
         GenericBluetoothDeviceListener listener2 = mock(GenericBluetoothDeviceListener.class);
         governor.addGenericBluetoothDeviceListener(listener1);
         governor.addGenericBluetoothDeviceListener(listener2);
 
-        governor.notifyRSSIChanged(RSSI);
+        governor.updateRSSI(RSSI);
 
         InOrder inOrder = inOrder(listener1, listener2);
 
@@ -636,11 +735,59 @@ public class DeviceGovernorImplTest {
         // this should be ignored by governor, a log message must be issued
         doThrow(Exception.class).when(listener1).rssiChanged(RSSI);
 
-        governor.notifyRSSIChanged(RSSI);
+        governor.updateRSSI(RSSI);
         inOrder.verify(listener1, times(1)).rssiChanged(RSSI);
         inOrder.verify(listener2, times(1)).rssiChanged(RSSI);
 
         inOrder.verifyNoMoreInteractions();
+    }
+
+    @Test
+    public void testNotifyRSSIChangedWithFilter() {
+        GenericBluetoothDeviceListener listener = mock(GenericBluetoothDeviceListener.class);
+        governor.addGenericBluetoothDeviceListener(listener);
+
+        short filteredRssi = -60;
+
+        when(rssiFilter.next(RSSI)).thenReturn(filteredRssi);
+        governor.setRssiFilter(rssiFilter);
+        assertTrue(governor.isRssiFilteringEnabled());
+        assertEquals(rssiFilter, governor.getRssiFilter());
+
+        governor.updateRSSI(RSSI);
+
+        verify(rssiFilter, times(1)).next(RSSI);
+        verify(listener, times(1)).rssiChanged(filteredRssi);
+
+        governor.setRssiReportingRate(0);
+        governor.setRssiFilteringEnabled(false);
+
+        governor.updateRSSI(RSSI);
+        verify(rssiFilter, times(1)).next(RSSI);
+        verify(listener, times(1)).rssiChanged(RSSI);
+    }
+
+    @Test
+    public void testNotifyRSSIReportingRate() {
+        GenericBluetoothDeviceListener listener = mock(GenericBluetoothDeviceListener.class);
+        governor.addGenericBluetoothDeviceListener(listener);
+
+        governor.setRssiReportingRate(0);
+        assertEquals(0, governor.getRssiReportingRate());
+
+        governor.updateRSSI(RSSI);
+        governor.updateRSSI(RSSI);
+
+        verify(listener, times(2)).rssiChanged(RSSI);
+
+        governor.setRssiReportingRate(5000);
+        assertEquals(5000, governor.getRssiReportingRate());
+
+        // these ones should be skipped
+        governor.updateRSSI(RSSI);
+        governor.updateRSSI(RSSI);
+
+        verify(listener, times(2)).rssiChanged(RSSI);
     }
 
     @Test
@@ -790,7 +937,7 @@ public class DeviceGovernorImplTest {
         notificationCaptor.getValue().notify(RSSI);
 
         verify(genericDeviceListener, times(1)).rssiChanged(RSSI);
-        verify(governor, times(1)).notifyRSSIChanged(RSSI);
+        verify(governor, times(1)).updateRSSI(RSSI);
         verify(governor, times(1)).updateLastChanged();
     }
 
@@ -817,6 +964,120 @@ public class DeviceGovernorImplTest {
         verify(governor, times(1)).notifyBlocked(false);
         verify(governor, times(2)).updateLastChanged();
     }
+
+    @Test
+    public void testEstimatedDistanceRssiFilter() {
+        // The calculation is based on the logarithmetic function: d = 10 ^ ((TxPower - RSSI) / 10n)
+        // where n ranges from 2 to 4 (environemnt specific factor, e.g. 2 outdoors -> 4 indoors)
+
+        governor.setSignalPropagationExponent(2.0);
+        assertEquals(2.0, governor.getSignalPropagationExponent(), 0.1);
+        governor.setRssiFilteringEnabled(true);
+        governor.setRssiFilter(rssiFilter);
+        governor.setMeasuredTxPower((short) -60);
+        assertEquals(-60, governor.getMeasuredTxPower());
+        when(rssiFilter.current()).thenReturn((short) -60);
+
+        // Tx Power is not reported by device and measured Tx Power is not set, then a default Tx Power is used (-60),
+        // this means that Tx Power equals to RSSI, therefore estimated distance should be 1m
+        assertEquals(1.0, governor.getEstimatedDistance(), 0.01);
+
+        // outdoor, same distance, signal is stronger, compensated by propagation exponent
+        governor.setSignalPropagationExponent(2.0);
+        when(rssiFilter.current()).thenReturn((short) -65);
+        assertEquals(1.778, governor.getEstimatedDistance(), 0.001);
+        // indoor, same distance, signal is weaker, compensated by propagation exponent
+        governor.setSignalPropagationExponent(4.0);
+        when(rssiFilter.current()).thenReturn((short) -70);
+        assertEquals(1.778, governor.getEstimatedDistance(), 0.001);
+
+        governor.setSignalPropagationExponent(2.0);
+        when(rssiFilter.current()).thenReturn((short) -55);
+        assertEquals(0.562, governor.getEstimatedDistance(), 0.001);
+
+        governor.setSignalPropagationExponent(4.0);
+        when(rssiFilter.current()).thenReturn((short) -65);
+        assertEquals(1.333, governor.getEstimatedDistance(), 0.001);
+
+        governor.setSignalPropagationExponent(4.0);
+        when(rssiFilter.current()).thenReturn((short) -55);
+        assertEquals(0.749, governor.getEstimatedDistance(), 0.001);
+
+        // checking if Tx Power makes any difference
+        governor.setMeasuredTxPower((short) -65);
+        when(rssiFilter.current()).thenReturn((short) -65);
+        assertEquals(1.0, governor.getEstimatedDistance(), 0.001);
+
+    }
+
+    @Test
+    public void testEstimatedDistanceDisabledRssiFilter() {
+        // The calculation is based on the logarithmetic function: d = 10 ^ ((TxPower - RSSI) / 10n)
+        // where n ranges from 2 to 4 (environemnt specific factor, e.g. 2 outdoors -> 4 indoors)
+
+        governor.setSignalPropagationExponent(2.0);
+        assertEquals(2.0, governor.getSignalPropagationExponent(), 0.1);
+        governor.setMeasuredTxPower((short) -60);
+        assertEquals(-60, governor.getMeasuredTxPower());
+        when(device.getRSSI()).thenReturn((short) -60);
+
+        // device is not ready
+        Whitebox.setInternalState(governor, "bluetoothObject", null);
+        assertEquals(0.0, governor.getEstimatedDistance(), 0.01);
+
+        // now it has become ready
+        Whitebox.setInternalState(governor, "bluetoothObject", device);
+
+        // Tx Power is not reported by device and measured Tx Power is not set, then a default Tx Power is used (-60),
+        // this means that Tx Power equals to RSSI, therefore estimated distance should be 1m
+        assertEquals(1.0, governor.getEstimatedDistance(), 0.01);
+
+        // outdoor, same distance, signal is stronger, compensated by propagation exponent
+        governor.setSignalPropagationExponent(2.0);
+        when(device.getRSSI()).thenReturn((short) -65);
+        assertEquals(1.778, governor.getEstimatedDistance(), 0.001);
+        // indoor, same distance, signal is weaker, compensated by propagation exponent
+        governor.setSignalPropagationExponent(4.0);
+        when(device.getRSSI()).thenReturn((short) -70);
+        assertEquals(1.778, governor.getEstimatedDistance(), 0.001);
+
+        governor.setSignalPropagationExponent(2.0);
+        when(device.getRSSI()).thenReturn((short) -55);
+        assertEquals(0.562, governor.getEstimatedDistance(), 0.001);
+
+        governor.setSignalPropagationExponent(4.0);
+        when(device.getRSSI()).thenReturn((short) -65);
+        assertEquals(1.333, governor.getEstimatedDistance(), 0.001);
+
+        governor.setSignalPropagationExponent(4.0);
+        when(device.getRSSI()).thenReturn((short) -55);
+        assertEquals(0.749, governor.getEstimatedDistance(), 0.001);
+    }
+
+    @Test
+    public void testEstimatedDistanceTxPower() {
+        // The calculation is based on the logarithmetic function: d = 10 ^ ((TxPower - RSSI) / 10n)
+        // where n ranges from 2 to 4 (environemnt specific factor, e.g. 2 outdoors -> 4 indoors)
+
+        governor.setSignalPropagationExponent(2.0);
+        assertEquals(2.0, governor.getSignalPropagationExponent(), 0.1);
+        governor.setRssiFilteringEnabled(true);
+        governor.setRssiFilter(rssiFilter);
+
+        // the default Tx Power is -55
+        when(rssiFilter.current()).thenReturn((short) -55);
+        assertEquals(1.0, governor.getEstimatedDistance(), 0.001);
+
+        when(device.getTxPower()).thenReturn((short) -60);
+        governor.setMeasuredTxPower((short) 0);
+        assertEquals(0.562, governor.getEstimatedDistance(), 0.001);
+
+        // measured Tx Power should get precedence
+        when(device.getTxPower()).thenReturn((short) -60);
+        governor.setMeasuredTxPower((short) -65);
+        assertEquals(0.316, governor.getEstimatedDistance(), 0.001);
+    }
+
 
     private CharacteristicGovernor mockCharacteristicGovernor(URL url) {
         CharacteristicGovernor governor = mock(CharacteristicGovernor.class);

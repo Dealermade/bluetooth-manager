@@ -20,38 +20,65 @@ package org.sputnikdev.bluetooth.manager.impl;
  * #L%
  */
 
-import java.time.Instant;
-import java.util.*;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.sputnikdev.bluetooth.Filter;
+import org.sputnikdev.bluetooth.RssiKalmanFilter;
 import org.sputnikdev.bluetooth.URL;
-import org.sputnikdev.bluetooth.manager.*;
+import org.sputnikdev.bluetooth.manager.AdapterGovernor;
+import org.sputnikdev.bluetooth.manager.BluetoothObjectType;
+import org.sputnikdev.bluetooth.manager.BluetoothObjectVisitor;
+import org.sputnikdev.bluetooth.manager.BluetoothSmartDeviceListener;
+import org.sputnikdev.bluetooth.manager.CharacteristicGovernor;
+import org.sputnikdev.bluetooth.manager.DeviceGovernor;
+import org.sputnikdev.bluetooth.manager.GattCharacteristic;
+import org.sputnikdev.bluetooth.manager.GattService;
+import org.sputnikdev.bluetooth.manager.GenericBluetoothDeviceListener;
+import org.sputnikdev.bluetooth.manager.NotReadyException;
 import org.sputnikdev.bluetooth.manager.transport.Characteristic;
 import org.sputnikdev.bluetooth.manager.transport.Device;
 import org.sputnikdev.bluetooth.manager.transport.Notification;
 import org.sputnikdev.bluetooth.manager.transport.Service;
 
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
 /**
  *
  * @author Vlad Kolotov
  */
-class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements DeviceGovernor {
-
-    public static final int BLE_BLUETOOTH_CLASS = 0;
+class DeviceGovernorImpl extends AbstractBluetoothObjectGovernor<Device> implements DeviceGovernor {
 
     private Logger logger = LoggerFactory.getLogger(DeviceGovernorImpl.class);
 
-    private final List<GenericBluetoothDeviceListener> genericBluetoothDeviceListeners = new ArrayList<>();
-    private final List<BluetoothSmartDeviceListener> bluetoothSmartDeviceListeners = new ArrayList<>();
+    static final short DEFAULT_TX_POWER = -55;
+    static final double DEAFULT_SIGNAL_PROPAGATION_EXPONENT = 4.0; // indoor
+
+    private final List<GenericBluetoothDeviceListener> genericBluetoothDeviceListeners = new CopyOnWriteArrayList<>();
+    private final List<BluetoothSmartDeviceListener> bluetoothSmartDeviceListeners = new CopyOnWriteArrayList<>();
     private ConnectionNotification connectionNotification;
     private BlockedNotification blockedNotification;
     private ServicesResolvedNotification servicesResolvedNotification;
     private RSSINotification rssiNotification;
     private boolean connectionControl;
     private boolean blockedControl;
-    private boolean online = false;
+    private boolean online;
     private int onlineTimeout = 20;
+
+    private final Lock rssiUpdateLock = new ReentrantLock();
+    private Filter<Short> rssiFilter = new RssiKalmanFilter();
+    private boolean rssiFilteringEnabled = true;
+    private long rssiReportingRate = 1000;
+    private Date rssiLastNotified = new Date();
+    private short measuredTxPower;
+    private double signalPropagationExponent = DEAFULT_SIGNAL_PROPAGATION_EXPONENT;
 
     DeviceGovernorImpl(BluetoothManagerImpl bluetoothManager, URL url) {
         super(bluetoothManager, url);
@@ -71,11 +98,15 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
         if (adapterGovernor != null && adapterGovernor.isReady() && adapterGovernor.isPowered()) {
             updateBlocked(device);
             if (!blockedControl) {
+                // Note: BlueGiga and TinyB devices work in different way:
+                // TinyB would have thrown an exception if the device was out of range (or turned off)
+                // BlueGiga would not thrown any exception by now
+                // threfore we need to check if BlueGiga device is still alive by querying the device RSSI
+                // Further note: TinyB device when connected constantly returns the very last known RSSI
                 boolean connected = updateConnected(device);
                 if (connected) {
-                    updateOnline(true);
-                    updateCharacteristics();
-                    return;
+                    notifyRSSIChanged(getRSSI());
+                    updateLastChanged();
                 }
             }
         }
@@ -166,12 +197,14 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
 
     @Override
     public boolean isOnline() {
-        return Instant.now().minusSeconds(this.onlineTimeout).isBefore(this.getLastActivity().toInstant());
+        Date lastActivity = getLastActivity();
+        return lastActivity != null && Instant.now().minusSeconds(onlineTimeout)
+            .isBefore(getLastActivity().toInstant());
     }
 
     @Override
     public int getOnlineTimeout() {
-        return this.onlineTimeout;
+        return onlineTimeout;
     }
 
     @Override
@@ -185,31 +218,100 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
     }
 
     @Override
-    public void addBluetoothSmartDeviceListener(BluetoothSmartDeviceListener bluetoothSmartDeviceListener) {
-        synchronized (this.bluetoothSmartDeviceListeners) {
-            this.bluetoothSmartDeviceListeners.add(bluetoothSmartDeviceListener);
+    public void setRssiFilter(Filter<Short> filter) {
+        rssiFilter = filter;
+    }
+
+    @Override
+    public Filter<Short> getRssiFilter() {
+        return rssiFilter;
+    }
+
+    @Override
+    public boolean isRssiFilteringEnabled() {
+        return rssiFilteringEnabled;
+    }
+
+    @Override
+    public void setRssiFilteringEnabled(boolean rssiFilteringEnabled) {
+        this.rssiFilteringEnabled = rssiFilteringEnabled;
+    }
+
+    @Override
+    public long getRssiReportingRate() {
+        return rssiReportingRate;
+    }
+
+    @Override
+    public short getTxPower() {
+        return getBluetoothObject().getTxPower();
+    }
+
+    @Override
+    public short getMeasuredTxPower() {
+        return measuredTxPower;
+    }
+
+    @Override
+    public void setMeasuredTxPower(short txPower) {
+        measuredTxPower = txPower;
+    }
+
+    @Override
+    public double getSignalPropagationExponent() {
+        return signalPropagationExponent;
+    }
+
+    @Override
+    public void setSignalPropagationExponent(double signalPropagationExponent) {
+        this.signalPropagationExponent = signalPropagationExponent;
+    }
+
+    @Override
+    public double getEstimatedDistance() {
+        short rssi = 0;
+        if (rssiFilteringEnabled && rssiFilter != null) {
+            rssi = rssiFilter.current();
         }
+        if (rssi == 0 && isReady()) {
+            rssi = getRSSI();
+        }
+        if (rssi == 0) {
+            return 0;
+        }
+        short txPower = getMeasuredTxPower();
+        if (txPower == 0 && isReady()) {
+            txPower = getTxPower();
+        }
+        if (txPower == 0) {
+            txPower = DEFAULT_TX_POWER;
+        }
+        return Math.pow(10d, ((double) txPower - rssi) / (10 * signalPropagationExponent));
+    }
+
+    @Override
+    public void setRssiReportingRate(long rssiReportingRate) {
+        this.rssiReportingRate = rssiReportingRate;
+    }
+
+    @Override
+    public void addBluetoothSmartDeviceListener(BluetoothSmartDeviceListener bluetoothSmartDeviceListener) {
+        bluetoothSmartDeviceListeners.add(bluetoothSmartDeviceListener);
     }
 
     @Override
     public void removeBluetoothSmartDeviceListener(BluetoothSmartDeviceListener bluetoothSmartDeviceListener) {
-        synchronized (this.bluetoothSmartDeviceListeners) {
-            this.bluetoothSmartDeviceListeners.remove(bluetoothSmartDeviceListener);
-        }
+        bluetoothSmartDeviceListeners.remove(bluetoothSmartDeviceListener);
     }
 
     @Override
     public void addGenericBluetoothDeviceListener(GenericBluetoothDeviceListener genericBluetoothDeviceListener) {
-        synchronized (this.genericBluetoothDeviceListeners) {
-            this.genericBluetoothDeviceListeners.add(genericBluetoothDeviceListener);
-        }
+        genericBluetoothDeviceListeners.add(genericBluetoothDeviceListener);
     }
 
     @Override
     public void removeGenericBluetoothDeviceListener(GenericBluetoothDeviceListener listener) {
-        synchronized (this.genericBluetoothDeviceListeners) {
-            this.genericBluetoothDeviceListeners.remove(listener);
-        }
+        genericBluetoothDeviceListeners.remove(listener);
     }
 
     @Override
@@ -258,75 +360,85 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
     }
 
     void notifyConnected(boolean connected) {
-        synchronized (this.bluetoothSmartDeviceListeners) {
-            for (BluetoothSmartDeviceListener listener : this.bluetoothSmartDeviceListeners) {
-                try {
-                    if (connected) {
-                        listener.connected();
-                    } else {
-                        listener.disconnected();
-                    }
-                } catch (Exception ex) {
-                    logger.error("Execution error of a connection listener", ex);
+        bluetoothSmartDeviceListeners.forEach(listener -> {
+            try {
+                if (connected) {
+                    listener.connected();
+                } else {
+                    listener.disconnected();
                 }
+            } catch (Exception ex) {
+                logger.error("Execution error of a connection listener", ex);
             }
-        }
+        });
     }
 
     void notifyBlocked(boolean blocked) {
-        synchronized (this.genericBluetoothDeviceListeners) {
-            for (GenericBluetoothDeviceListener listener : this.genericBluetoothDeviceListeners) {
-                try {
-                    listener.blocked(blocked);
-                } catch (Exception ex) {
-                    logger.error("Execution error of a Blocked listener", ex);
-                }
+        genericBluetoothDeviceListeners.forEach(listener -> {
+            try {
+                listener.blocked(blocked);
+            } catch (Exception ex) {
+                logger.error("Execution error of a Blocked listener", ex);
             }
-        }
+        });
     }
 
     void notifyServicesResolved(boolean resolved) {
-        synchronized (this.bluetoothSmartDeviceListeners) {
-            for (BluetoothSmartDeviceListener listener : this.bluetoothSmartDeviceListeners) {
-                try {
-                    if (resolved) {
-                        listener.servicesResolved(getResolvedServices());
-                    } else {
-                        listener.servicesUnresolved();
-                    }
-                } catch (Exception ex) {
-                    logger.error("Execution error of a service resolved listener", ex);
+        bluetoothSmartDeviceListeners.forEach(listener -> {
+            try {
+                if (resolved) {
+                    listener.servicesResolved(getResolvedServices());
+                } else {
+                    listener.servicesUnresolved();
                 }
+            } catch (Exception ex) {
+                logger.error("Execution error of a service resolved listener", ex);
+            }
+        });
+    }
+
+    void updateRSSI(short next) {
+        Filter<Short> filter = rssiFilter;
+        if (rssiUpdateLock.tryLock()) {
+            try {
+                if (filter != null && rssiFilteringEnabled) {
+                    // devices can report RSSI too fast that we can't handle it, so we skip some readings
+                    notifyRSSIChanged(filter.next(next));
+                } else {
+                    notifyRSSIChanged(next);
+                }
+            } finally {
+                rssiUpdateLock.unlock();
             }
         }
     }
 
-    void notifyRSSIChanged(Short rssi) {
-        synchronized (this.genericBluetoothDeviceListeners) {
-            for (GenericBluetoothDeviceListener listener : this.genericBluetoothDeviceListeners) {
+    void notifyRSSIChanged(short next) {
+        if (rssiReportingRate == 0
+            || System.currentTimeMillis() - rssiLastNotified.getTime() > rssiReportingRate) {
+            genericBluetoothDeviceListeners.forEach(listener -> {
                 try {
-                    listener.rssiChanged(rssi != null ? rssi : 0);
+                    listener.rssiChanged(next);
                 } catch (Exception ex) {
                     logger.error("Execution error of a RSSI listener", ex);
                 }
-            }
+            });
+            rssiLastNotified = new Date();
         }
     }
 
     void notifyOnline(boolean online) {
-        synchronized (this.genericBluetoothDeviceListeners) {
-            for (GenericBluetoothDeviceListener listener : this.genericBluetoothDeviceListeners) {
-                try {
-                    if (online) {
-                        listener.online();
-                    } else {
-                        listener.offline();
-                    }
-                } catch (Exception ex) {
-                    logger.error("Execution error of an online listener", ex);
+        genericBluetoothDeviceListeners.forEach(listener -> {
+            try {
+                if (online) {
+                    listener.online();
+                } else {
+                    listener.offline();
                 }
+            } catch (Exception ex) {
+                logger.error("Execution error of an online listener", ex);
             }
-        }
+        });
     }
 
     private List<Characteristic> getAllCharacteristics() throws NotReadyException {
@@ -344,33 +456,33 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
     }
 
     private void enableConnectionNotifications(Device bluetoothDevice) {
-        if (this.connectionNotification == null) {
+        if (connectionNotification == null) {
             logger.info("Enabling connection notification: {} ", getURL());
-            this.connectionNotification = new ConnectionNotification();
+            connectionNotification = new ConnectionNotification();
             bluetoothDevice.enableConnectedNotifications(connectionNotification);
         }
     }
 
     private void enableBlockedNotifications(Device bluetoothDevice) {
-        if (this.blockedNotification == null) {
+        if (blockedNotification == null) {
             logger.info("Enabling blocked notification: {} ", getURL());
-            this.blockedNotification = new BlockedNotification();
+            blockedNotification = new BlockedNotification();
             bluetoothDevice.enableBlockedNotifications(blockedNotification);
         }
     }
 
     private void enableServicesResolvedNotifications(Device bluetoothDevice) {
-        if (this.servicesResolvedNotification == null) {
+        if (servicesResolvedNotification == null) {
             logger.info("Enabling services resolved notification: {} ", getURL());
-            this.servicesResolvedNotification = new ServicesResolvedNotification();
-            bluetoothDevice.enableServicesResolvedNotifications(this.servicesResolvedNotification);
+            servicesResolvedNotification = new ServicesResolvedNotification();
+            bluetoothDevice.enableServicesResolvedNotifications(servicesResolvedNotification);
         }
     }
 
     private void enableRSSINotifications(Device bluetoothDevice) {
         if (rssiNotification == null) {
             logger.info("Enabling RSSI notification: {} ", getURL());
-            this.rssiNotification = new RSSINotification();
+            rssiNotification = new RSSINotification();
             bluetoothDevice.enableRSSINotifications(rssiNotification);
         }
     }
@@ -397,7 +509,7 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
         bluetoothManager.resetDescendants(url);
     }
 
-    private GattCharacteristic convert(Characteristic characteristic) {
+    private static GattCharacteristic convert(Characteristic characteristic) {
         return new GattCharacteristic(characteristic.getURL(), characteristic.getFlags());
     }
 
@@ -418,12 +530,7 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
     private boolean updateConnected(Device device) {
         boolean connected = device.isConnected();
         if (connectionControl && !connected) {
-            try {
-                connected = device.connect();
-            } catch (Exception ex) {
-                logger.debug("Could not connect: {}", ex.getMessage());
-                connected = false;
-            }
+            connected = device.connect();
         } else if (!connectionControl && connected) {
             device.disconnect();
             resetCharacteristics();
@@ -470,7 +577,7 @@ class DeviceGovernorImpl extends BluetoothObjectGovernor<Device> implements Devi
     private class RSSINotification implements Notification<Short> {
         @Override
         public void notify(Short rssi) {
-            notifyRSSIChanged(rssi);
+            updateRSSI(rssi);
             updateLastChanged();
         }
     }
